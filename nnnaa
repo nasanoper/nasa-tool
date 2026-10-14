@@ -1,0 +1,371 @@
+// ==UserScript==
+// @name         Chodenocto Universal
+// @namespace    http://tampermonkey.net/
+// @version      6.0-universal
+// @description  Universal: sniff check/job + check/countdown + check/continue on ANY page, replay 2x job + 2x countdown + 1x continue per stage until finish link. No privileged APIs, no hidden core. iOS friendly.
+// @match        *://*/*
+// @grant        none
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+  'use strict';
+  if (typeof window === 'undefined') return;
+  if (window.__octoUniRunning) return;
+  window.__octoUniRunning = true;
+
+  var VERSION = '6.0-universal';
+  var API_RE = /\/check\/(job|countdown|continue)(?:[\/?#]|$)/i;
+  var MAX_STAGES = 12;
+  var MAX_CONT_RETRY = 8;
+  var ENGINE_GRACE_MS = 350;
+
+  var templates = { job: null, countdown: null, cont: null };
+  var replaying = 0;
+  var engineStarted = false;
+  var finished = false;
+
+  // ---------- minimal log panel (no external assets) ----------
+  var panelBody = null;
+  function log(msg, kind) {
+    try {
+      if (!panelBody) return;
+      var row = document.createElement('div');
+      row.textContent = '[' + (kind || 'info') + '] ' + msg;
+      row.style.cssText = 'margin:2px 0;font-size:12px;color:#e8e8e8;word-break:break-all;';
+      panelBody.appendChild(row);
+    } catch (e) {}
+  }
+  function buildPanel() {
+    try {
+      var host = (typeof document !== 'undefined') && (document.body || document.documentElement);
+      if (!host) return;
+      if (document.getElementById && document.getElementById('octo-uni-panel')) return;
+      var box = document.createElement('div');
+      box.id = 'octo-uni-panel';
+      box.style.cssText = 'position:fixed;right:10px;bottom:10px;width:300px;max-height:220px;overflow:hidden;background:rgba(0,0,0,.9);border:1px solid #4ade80;border-radius:8px;z-index:2147483647;font-family:monospace;';
+      var head = document.createElement('div');
+      head.textContent = 'OCTO-UNI ' + VERSION;
+      head.style.cssText = 'padding:6px 8px;font-size:12px;font-weight:bold;color:#4ade80;border-bottom:1px solid #333;';
+      panelBody = document.createElement('div');
+      panelBody.style.cssText = 'padding:6px 8px;overflow-y:auto;max-height:180px;';
+      box.appendChild(head);
+      box.appendChild(panelBody);
+      host.appendChild(box);
+    } catch (e) {}
+  }
+  try {
+    if (typeof document !== 'undefined') {
+      if (document.readyState === 'loading' && document.addEventListener) {
+        document.addEventListener('DOMContentLoaded', buildPanel);
+      } else {
+        buildPanel();
+      }
+      setTimeout(buildPanel, 1500);
+    }
+  } catch (e) {}
+
+  // ---------- capture ----------
+  function endpointOf(url) {
+    try {
+      var m = String(url).match(API_RE);
+      return m ? m[1].toLowerCase() : null;
+    } catch (e) { return null; }
+  }
+  function normHeaders(h) {
+    var out = {};
+    try {
+      if (!h) return out;
+      if (typeof h.forEach === 'function') {
+        h.forEach(function (v, k) { out[String(k).toLowerCase()] = String(v); });
+      } else if (Object.prototype.toString.call(h) === '[object Array]') {
+        for (var i = 0; i < h.length; i++) out[String(h[i][0]).toLowerCase()] = String(h[i][1]);
+      } else {
+        for (var k in h) {
+          if (Object.prototype.hasOwnProperty.call(h, k)) out[String(k).toLowerCase()] = String(h[k]);
+        }
+      }
+      delete out['content-length'];
+    } catch (e) {}
+    return out;
+  }
+  function captureRequest(url, method, headers, body) {
+    var ep = endpointOf(url);
+    if (!ep) return;
+    var key = (ep === 'continue') ? 'cont' : ep;
+    try {
+      templates[key] = {
+        url: String(url),
+        method: (method || 'GET').toUpperCase(),
+        headers: normHeaders(headers),
+        body: (body === undefined ? null : body)
+      };
+      log('bat duoc api: ' + ep + ' <- ' + String(url).slice(0, 90), 'sys');
+    } catch (e) {}
+    if (ep === 'job' && !engineStarted && !finished) scheduleEngine();
+  }
+
+  // ---------- response scan (passive watch) ----------
+  function tryJson(t) {
+    try {
+      if (!t || typeof t !== 'string') return null;
+      var s = t.trim();
+      if (s.charCodeAt(0) !== 123 && s.charCodeAt(0) !== 91) return null;
+      return JSON.parse(s);
+    } catch (e) { return null; }
+  }
+  function strField(o, names) {
+    try {
+      for (var i = 0; i < names.length; i++) {
+        var v = o[names[i]];
+        if (typeof v === 'string' && v.length > 0) return v;
+      }
+      if (o && typeof o.data === 'object' && o.data) {
+        for (var j = 0; j < names.length; j++) {
+          var v2 = o.data[names[j]];
+          if (typeof v2 === 'string' && v2.length > 0) return v2;
+        }
+      }
+    } catch (e) {}
+    return '';
+  }
+  function cleanUrl(u) {
+    try { return String(u).replace(/\\\//g, '/'); } catch (e) { return u; }
+  }
+  function finishUrlFromText(t) {
+    if (!t || typeof t !== 'string') return '';
+    try {
+      var m = t.match(/<a[^>]+href=["'](https?:\/\/[^"']+)["'][^>]*>[^<]*Link\s*G[óo]c/i);
+      if (m) return cleanUrl(m[1]);
+      var f = t.match(/"(https?:\\?\/\\?\/[^"']*?finish[^"']*?)"/i);
+      if (f) return cleanUrl(f[1]);
+      var g = t.match(/href=["'](https?:\/\/[^"']*?finish[^"']*?)["']/i);
+      if (g) return cleanUrl(g[1]);
+    } catch (e) {}
+    return '';
+  }
+  function extractFinish(t) {
+    try {
+      var o = tryJson(t);
+      if (o) {
+        var u = strField(o, ['url', 'link', 'redirect', 'redirectUrl', 'dest', 'target']);
+        if (u && /^https?:\/\//i.test(cleanUrl(u))) {
+          if (String(o.status || '').toLowerCase() === 'finish' || /finish/i.test(u)) return cleanUrl(u);
+        }
+      }
+      return finishUrlFromText(t);
+    } catch (e) { return ''; }
+  }
+  function extractWait(t) {
+    try {
+      var o = tryJson(t);
+      if (o && o.wait !== undefined) {
+        var w = parseInt(o.wait, 10);
+        if (!isNaN(w) && w >= 0) return w;
+      }
+    } catch (e) {}
+    return 0;
+  }
+  function scanTextForFinish(t) {
+    if (finished || !t) return;
+    try {
+      var url = extractFinish(t);
+      if (url) onFinish(url, 'watch');
+    } catch (e) {}
+  }
+  function watchResponse(p) {
+    try {
+      if (!p || typeof p.then !== 'function') return;
+      p.then(function (res) {
+        try {
+          if (!res || typeof res.clone !== 'function') return;
+          res.clone().text().then(function (t) { scanTextForFinish(t); }).catch(function () {});
+        } catch (e) {}
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  // ---------- hooks (page's own traffic) ----------
+  var origFetch = null;
+  try {
+    if (typeof window.fetch === 'function') {
+      origFetch = window.fetch;
+      window.fetch = function (input, init) {
+        var url = (typeof input === 'string') ? input : (input && input.url) || '';
+        var method = (init && init.method) || (input && input.method) || 'GET';
+        var headers = (init && init.headers) || (input && input.headers) || {};
+        var body = (init && ('body' in Object(init))) ? init.body : undefined;
+        var p = origFetch.apply(this, arguments);
+        try {
+          if (!replaying) {
+            captureRequest(url, method, headers, body);
+            watchResponse(p);
+          }
+        } catch (e) {}
+        return p;
+      };
+    }
+  } catch (e) {}
+  try {
+    var XHRP = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+    if (XHRP && XHRP.open && XHRP.send) {
+      var oOpen = XHRP.open, oSend = XHRP.send;
+      var oSet = XHRP.setRequestHeader;
+      XHRP.open = function (m, u) {
+        try { this.__uniMethod = m; this.__uniUrl = u; } catch (e) {}
+        return oOpen.apply(this, arguments);
+      };
+      if (typeof oSet === 'function') {
+        XHRP.setRequestHeader = function (k, v) {
+          try {
+            this.__uniHeaders = this.__uniHeaders || {};
+            this.__uniHeaders[String(k)] = String(v);
+          } catch (e) {}
+          return oSet.apply(this, arguments);
+        };
+      }
+      XHRP.send = function (b) {
+        try {
+          if (!replaying && this.__uniUrl) {
+            captureRequest(this.__uniUrl, this.__uniMethod, this.__uniHeaders, (b === undefined ? null : b));
+            var self = this;
+            var onL = function () { try { scanTextForFinish(self.responseText); } catch (e) {} };
+            if (typeof self.addEventListener === 'function') self.addEventListener('load', onL);
+          }
+        } catch (e) {}
+        return oSend.apply(this, arguments);
+      };
+    }
+  } catch (e) {}
+
+  // ---------- replay (direct, on-page) ----------
+  function sender() {
+    return origFetch || window.fetch;
+  }
+  function doReplay(t) {
+    if (!t) return Promise.reject(new Error('missing template'));
+    var fn = sender();
+    if (typeof fn !== 'function') return Promise.reject(new Error('no fetch'));
+    var opts = { method: t.method, headers: t.headers, credentials: 'include' };
+    if (t.method !== 'GET' && t.method !== 'HEAD' && t.body !== null && t.body !== undefined) opts.body = t.body;
+    replaying++;
+    var p;
+    try {
+      p = fn.call(window, t.url, opts);
+    } catch (e) {
+      replaying--;
+      return Promise.reject(e);
+    }
+    function done(v, isErr) {
+      replaying--;
+      if (isErr) throw v;
+      return v;
+    }
+    return p.then(function (res) {
+      var d = done(res, false);
+      try {
+        if (d && typeof d.text === 'function') return d.text();
+      } catch (e) {}
+      return '';
+    }, function (err) { done(err, true); });
+  }
+  function fire(t) {
+    try {
+      if (!t) return;
+      doReplay(t).catch(function () {});
+    } catch (e) {}
+  }
+
+  // ---------- engine: 2x job + 2x countdown, then 1x continue, per stage ----------
+  function scheduleEngine() {
+    if (engineStarted || finished) return;
+    engineStarted = true;
+    log('phat hien check/job, chuan bi tu goi API...', 'sys');
+    setTimeout(function () { runStage(0); }, ENGINE_GRACE_MS);
+  }
+  function runStage(stage) {
+    if (finished) return;
+    if (stage >= MAX_STAGES) { log('dung: vuot so chang toi da (' + MAX_STAGES + ')', 'warn'); return; }
+    if (!templates.job) { log('chua bat duoc template job, doi...', 'warn'); setTimeout(function () { runStage(stage); }, 2000); return; }
+    log('chang ' + (stage + 1) + ': goi don 2x job + 2x countdown...', 'sys');
+    doReplay(templates.job).then(function () {
+      return doReplay(templates.job);
+    }).then(function (lastJobText) {
+      if (finished) return;
+      var fin = extractFinish(lastJobText);
+      if (fin) { onFinish(fin, 'job'); return; }
+      var waitSec = extractWait(lastJobText);
+      fire(templates.countdown);
+      fire(templates.countdown);
+      var delay = waitSec > 0 ? (waitSec * 1000 + 500) : 600;
+      log('cho ' + delay + 'ms roi goi continue...', 'sys');
+      setTimeout(function () { doContinue(stage, 0); }, delay);
+    }).catch(function (e) {
+      if (finished) return;
+      log('job loi: ' + ((e && e.message) || e) + ', thu lai chang...', 'warn');
+      setTimeout(function () { runStage(stage); }, 2000);
+    });
+  }
+  function doContinue(stage, retry) {
+    if (finished) return;
+    if (!templates.cont) { log('chua bat duoc template continue, doi...', 'warn'); setTimeout(function () { doContinue(stage, retry); }, 2000); return; }
+    if (retry > MAX_CONT_RETRY) { log('continue qua so lan thu, sang chang tiep...', 'warn'); runStage(stage + 1); return; }
+    doReplay(templates.cont).then(function (t) {
+      if (finished) return;
+      var fin = extractFinish(t);
+      if (fin) { onFinish(fin, 'continue'); return; }
+      var o = tryJson(t);
+      if (o && String(o.status || '').toLowerCase() === 'success') {
+        log('xong chang ' + (stage + 1) + ', sang chang tiep...', 'ok');
+        runStage(stage + 1);
+        return;
+      }
+      var w = extractWait(t);
+      log('continue chua finish, thu lai (' + (retry + 1) + '/' + MAX_CONT_RETRY + ')...', 'warn');
+      setTimeout(function () { doContinue(stage, retry + 1); }, w > 0 ? (w * 1000 + 500) : 2000);
+    }).catch(function () {
+      if (finished) return;
+      setTimeout(function () { doContinue(stage, retry + 1); }, 2000);
+    });
+  }
+
+  // ---------- finish ----------
+  function copyText(s) {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        navigator.clipboard.writeText(s).catch(function () {});
+        return;
+      }
+      var ta = document.createElement('textarea');
+      ta.value = s;
+      ta.style.cssText = 'position:fixed;opacity:0;';
+      (document.body || document.documentElement).appendChild(ta);
+      if (typeof ta.select === 'function') ta.select();
+      if (typeof document.execCommand === 'function') document.execCommand('copy');
+      if (typeof ta.remove === 'function') ta.remove();
+    } catch (e) {}
+  }
+  function onFinish(url, src) {
+    if (finished) return;
+    finished = true;
+    try { log('FINISH (' + src + '): ' + url, 'ok'); } catch (e) {}
+    try { if (typeof console !== 'undefined') console.log('[OCTO_UNI] finish | ' + url); } catch (e) {}
+    copyText(url);
+    try {
+      setTimeout(function () {
+        try { window.location.href = url; } catch (e) {}
+      }, 800);
+    } catch (e) {}
+  }
+
+  try {
+    window.__octoUni = {
+      version: VERSION,
+      templates: function () { return templates; },
+      state: function () {
+        return { engineStarted: engineStarted, finished: finished, replaying: replaying };
+      },
+      start: scheduleEngine
+    };
+  } catch (e) {}
+})();
